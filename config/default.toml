@@ -23,3 +23,8 @@ confidence_threshold = 0.7  # Flag for review below this
 max_tokens = 4096
 temperature = 0.1         # Low for structured extraction
 server_url = "http://127.0.0.1:8765"
+
+[prompts]
+default_template = "prompts/invoice_extract.txt"
+supplier_templates_dir = "prompts/suppliers"
+use_supplier_templates = true  # Re-extract with supplier-specific prompt if available

@@ -10,7 +10,10 @@ mod validation;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
+use notify::{Config as NotifyConfig, RecommendedWatcher, RecursiveMode, Watcher};
+use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
@@ -74,6 +77,17 @@ enum Commands {
 
     /// Initialize default configuration
     Init,
+
+    /// Watch input directory for new PDF files and process automatically
+    Watch {
+        /// Poll interval in seconds (default: 2)
+        #[arg(long, default_value = "2")]
+        interval: u64,
+
+        /// Number of retries for failed extractions
+        #[arg(long, default_value = "2")]
+        retries: u32,
+    },
 }
 
 fn main() -> Result<()> {
@@ -101,6 +115,7 @@ fn main() -> Result<()> {
         Commands::Status => status_command(config),
         Commands::Models => models_command(),
         Commands::Init => init_command(),
+        Commands::Watch { interval, retries } => watch_command(config, interval, retries),
     }
 }
 
@@ -517,4 +532,199 @@ fn init_command() -> Result<()> {
     println!("Created directories: input/, output/, archive/");
 
     Ok(())
+}
+
+/// Watch input directory for new PDF files
+fn watch_command(config: Config, interval: u64, max_retries: u32) -> Result<()> {
+    println!("Invoice OCR Watch Mode");
+    println!("======================\n");
+    println!("Watching: {}", config.processing.input_dir.display());
+    println!("Output:   {}", config.processing.output_dir.display());
+    println!("Poll interval: {}s", interval);
+    println!("\nPress Ctrl+C to stop.\n");
+
+    // Ensure directories exist
+    std::fs::create_dir_all(&config.processing.input_dir)?;
+    std::fs::create_dir_all(&config.processing.output_dir)?;
+    if config.processing.archive_processed {
+        std::fs::create_dir_all(&config.processing.archive_dir)?;
+    }
+
+    // Create inference client
+    let client = InferenceClient::new(&config.inference.server_url)
+        .context("Failed to create inference client")?;
+
+    // Check server status
+    match client.check_status() {
+        Ok(status) => {
+            if status.model_loaded {
+                println!("Server ready with model: {}", status.model_name.unwrap_or_default());
+            } else {
+                println!("Warning: Model not loaded. First file will trigger loading.");
+            }
+        }
+        Err(e) => {
+            anyhow::bail!(
+                "Cannot connect to inference server at {}: {}\n\
+                 Start the server with: python python/inference_server.py",
+                config.inference.server_url,
+                e
+            );
+        }
+    }
+
+    // Track processed files to avoid reprocessing
+    let mut processed: HashSet<PathBuf> = HashSet::new();
+
+    // Get already existing files (don't process on startup)
+    if let Ok(entries) = std::fs::read_dir(&config.processing.input_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if is_pdf(&path) {
+                processed.insert(path);
+            }
+        }
+    }
+    println!("Found {} existing PDF(s) (will not reprocess)\n", processed.len());
+
+    // Set up file watcher
+    let (tx, rx) = mpsc::channel();
+
+    let mut watcher = RecommendedWatcher::new(
+        move |res: Result<notify::Event, notify::Error>| {
+            if let Ok(event) = res {
+                let _ = tx.send(event);
+            }
+        },
+        NotifyConfig::default().with_poll_interval(Duration::from_secs(interval)),
+    )?;
+
+    watcher.watch(&config.processing.input_dir, RecursiveMode::NonRecursive)?;
+
+    println!("Watching for new PDF files...\n");
+
+    // Process events
+    loop {
+        match rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(event) => {
+                // Look for created or modified PDF files
+                if matches!(
+                    event.kind,
+                    notify::EventKind::Create(_) | notify::EventKind::Modify(_)
+                ) {
+                    for path in event.paths {
+                        if is_pdf(&path) && !processed.contains(&path) {
+                            // Wait a moment for file to be fully written
+                            thread::sleep(Duration::from_millis(500));
+
+                            // Check file is stable (not being written)
+                            if !is_file_stable(&path) {
+                                continue;
+                            }
+
+                            println!("[{}] New file: {}",
+                                chrono::Local::now().format("%H:%M:%S"),
+                                path.file_name().unwrap_or_default().to_string_lossy()
+                            );
+
+                            processed.insert(path.clone());
+
+                            match process_single_file(&client, &config, &path, max_retries) {
+                                Ok(_) => println!("  Done.\n"),
+                                Err(e) => println!("  Failed: {}\n", e),
+                            }
+                        }
+                    }
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Normal timeout, continue watching
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                anyhow::bail!("File watcher disconnected");
+            }
+        }
+    }
+}
+
+/// Check if a path is a PDF file
+fn is_pdf(path: &PathBuf) -> bool {
+    path.extension()
+        .map(|ext| ext.eq_ignore_ascii_case("pdf"))
+        .unwrap_or(false)
+}
+
+/// Check if a file has stopped being written to
+fn is_file_stable(path: &PathBuf) -> bool {
+    let Ok(meta1) = std::fs::metadata(path) else {
+        return false;
+    };
+    let size1 = meta1.len();
+
+    thread::sleep(Duration::from_millis(200));
+
+    let Ok(meta2) = std::fs::metadata(path) else {
+        return false;
+    };
+    let size2 = meta2.len();
+
+    size1 == size2 && size2 > 0
+}
+
+/// Process a single file in watch mode
+fn process_single_file(
+    client: &InferenceClient,
+    config: &Config,
+    pdf_path: &PathBuf,
+    max_retries: u32,
+) -> Result<()> {
+    let result = process_with_retry(client, config, pdf_path, max_retries);
+
+    match result {
+        Ok(mut extraction) => {
+            // Validate and calculate confidence
+            let errors = validate_extraction(&extraction);
+            extraction.confidence = calculate_confidence(&extraction, &errors);
+
+            for error in &errors {
+                if error.severity != Severity::Info {
+                    extraction.warnings.push(format!("{}: {}", error.field, error.message));
+                }
+            }
+
+            // Write JSON output
+            let output_name = pdf_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("output");
+            let json_path = config.processing.output_dir.join(format!("{}.json", output_name));
+
+            std::fs::create_dir_all(&config.processing.output_dir)?;
+            output::write_json(&extraction, &json_path)?;
+
+            println!("  Confidence: {:.0}% | {} line items",
+                extraction.confidence.overall * 100.0,
+                extraction.line_items.len()
+            );
+
+            if extraction.confidence.overall < config.output.confidence_threshold {
+                println!("  [LOW CONFIDENCE] - flagged for review");
+            }
+
+            // Archive if configured
+            if config.processing.archive_processed {
+                match archive_file(pdf_path, &config.processing.archive_dir) {
+                    Ok(archive_path) => {
+                        println!("  Archived to: {}", archive_path.display());
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to archive: {}", e);
+                    }
+                }
+            }
+
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
 }

@@ -6,12 +6,16 @@ FastAPI server that handles model loading and inference requests from the Rust C
 Supports multiple model backends with hot-swapping capability.
 """
 
+import base64
+import io
 import json
 import logging
+import tempfile
 from pathlib import Path
 from typing import Optional, List
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 
@@ -23,12 +27,27 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Invoice OCR Inference Server")
 
+# Enable CORS for web UI
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # Global model state
 current_handler: Optional[ModelHandler] = None
 
 
 class InferenceRequest(BaseModel):
     image_path: str
+    prompt: str
+
+
+class Base64Request(BaseModel):
+    filename: str
+    data: str  # base64 encoded image or PDF
     prompt: str
 
 
@@ -96,15 +115,18 @@ def load_model(name: str = DEFAULT_MODEL) -> None:
 
 
 def extract_from_image(image_path: str, prompt: str) -> dict:
-    """Run extraction on an image."""
+    """Run extraction on an image file path."""
+    from PIL import Image
+    image = Image.open(image_path)
+    return extract_from_pil_image(image, prompt)
+
+
+def extract_from_pil_image(image, prompt: str) -> dict:
+    """Run extraction on a PIL Image."""
     global current_handler
 
     if current_handler is None:
         load_model()
-
-    from PIL import Image
-
-    image = Image.open(image_path)
 
     # Get raw response from model
     raw_response = current_handler.extract(image, prompt)
@@ -112,6 +134,45 @@ def extract_from_image(image_path: str, prompt: str) -> dict:
 
     # Parse JSON
     return parse_json_response(raw_response)
+
+
+def decode_base64_to_image(data: str, filename: str):
+    """Decode base64 data to PIL Image, handling PDFs if needed."""
+    from PIL import Image
+    import subprocess
+
+    # Decode base64
+    image_bytes = base64.b64decode(data)
+
+    # Check if it's a PDF
+    if filename.lower().endswith('.pdf') or image_bytes[:4] == b'%PDF':
+        # Convert PDF to image using pdftoppm
+        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as f:
+            f.write(image_bytes)
+            pdf_path = f.name
+
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                # Convert first page to PNG
+                result = subprocess.run(
+                    ['pdftoppm', '-png', '-f', '1', '-l', '1', '-r', '150', pdf_path, f'{tmpdir}/page'],
+                    capture_output=True, text=True
+                )
+                if result.returncode != 0:
+                    raise ValueError(f"PDF conversion failed: {result.stderr}")
+
+                # Find the output file
+                import glob
+                png_files = glob.glob(f'{tmpdir}/page*.png')
+                if not png_files:
+                    raise ValueError("PDF conversion produced no output")
+
+                return Image.open(png_files[0]).copy()
+        finally:
+            Path(pdf_path).unlink(missing_ok=True)
+    else:
+        # Regular image
+        return Image.open(io.BytesIO(image_bytes))
 
 
 @app.get("/status", response_model=StatusResponse)
@@ -157,6 +218,28 @@ async def extract(request: InferenceRequest):
         )
     except Exception as e:
         logger.exception("Extraction failed")
+        return InferenceResponse(success=False, error=str(e))
+
+
+@app.post("/extract-base64", response_model=InferenceResponse)
+async def extract_base64(request: Base64Request):
+    """Extract invoice data from base64-encoded image or PDF (for web UI)."""
+    try:
+        # Decode and convert to image
+        image = decode_base64_to_image(request.data, request.filename)
+
+        # Run extraction
+        data = extract_from_pil_image(image, request.prompt)
+        return InferenceResponse(success=True, data=data)
+
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON parse error: {e}")
+        return InferenceResponse(
+            success=False,
+            error=f"Failed to parse model output as JSON: {e}",
+        )
+    except Exception as e:
+        logger.exception("Base64 extraction failed")
         return InferenceResponse(success=False, error=str(e))
 
 

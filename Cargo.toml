@@ -37,3 +37,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Progress bars
 indicatif = "0.17"
+
+# File watching
+notify = "6"

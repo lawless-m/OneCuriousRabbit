@@ -10,6 +10,8 @@ pub struct Config {
     pub processing: ProcessingConfig,
     pub output: OutputConfig,
     pub inference: InferenceConfig,
+    #[serde(default)]
+    pub prompts: PromptsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +77,23 @@ pub struct InferenceConfig {
     pub server_url: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromptsConfig {
+    pub default_template: PathBuf,
+    pub supplier_templates_dir: PathBuf,
+    pub use_supplier_templates: bool,
+}
+
+impl Default for PromptsConfig {
+    fn default() -> Self {
+        Self {
+            default_template: PathBuf::from("prompts/invoice_extract.txt"),
+            supplier_templates_dir: PathBuf::from("prompts/suppliers"),
+            use_supplier_templates: true,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -102,7 +121,54 @@ impl Default for Config {
                 temperature: 0.1,
                 server_url: "http://127.0.0.1:8765".to_string(),
             },
+            prompts: PromptsConfig::default(),
         }
+    }
+}
+
+impl PromptsConfig {
+    /// Find a supplier-specific template based on supplier name
+    pub fn find_supplier_template(&self, supplier_name: &str) -> Option<PathBuf> {
+        if !self.use_supplier_templates || supplier_name.is_empty() {
+            return None;
+        }
+
+        if !self.supplier_templates_dir.exists() {
+            return None;
+        }
+
+        // Normalize supplier name for matching
+        let normalized = supplier_name.to_lowercase().replace(' ', "-");
+
+        // Try to find a matching template
+        if let Ok(entries) = std::fs::read_dir(&self.supplier_templates_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().map(|e| e == "txt").unwrap_or(false) {
+                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                        // Check if supplier name contains the template name or vice versa
+                        let template_name = stem.to_lowercase();
+                        if normalized.contains(&template_name) || template_name.contains(&normalized) {
+                            return Some(path);
+                        }
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Load the default prompt template
+    pub fn load_default_template(&self) -> anyhow::Result<String> {
+        std::fs::read_to_string(&self.default_template)
+            .with_context(|| format!("Failed to load default prompt: {}", self.default_template.display()))
+    }
+
+    /// Load a specific prompt template
+    pub fn load_template(&self, path: &Path) -> anyhow::Result<String> {
+        std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to load prompt template: {}", path.display()))
     }
 }
 

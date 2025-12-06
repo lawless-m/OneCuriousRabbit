@@ -1,0 +1,25 @@
+# Invoice OCR Configuration
+
+[model]
+name = "Qwen/Qwen2-VL-7B-Instruct"
+backend = "transformers"  # transformers, vllm, ollama
+quantization = "none"     # none, int8, int4
+device = "cuda:0"
+
+[processing]
+input_dir = "./input"
+output_dir = "./output"
+archive_dir = "./archive"
+archive_processed = true
+image_dpi = 150           # Higher = better quality, slower
+image_format = "png"
+
+[output]
+format = "json"           # json, csv, both
+include_raw_text = false
+confidence_threshold = 0.7  # Flag for review below this
+
+[inference]
+max_tokens = 4096
+temperature = 0.1         # Low for structured extraction
+server_url = "http://127.0.0.1:8765"

@@ -1,0 +1,41 @@
+# Rust
+/target/
+Cargo.lock
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+ENV/
+env/
+*.egg-info/
+.eggs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Project directories (contain working data)
+/input/
+/output/
+/archive/
+
+# Temporary files
+*.tmp
+*.temp
+.DS_Store
+
+# Model weights (if cached locally)
+*.bin
+*.safetensors
+*.gguf
+
+# Logs
+*.log

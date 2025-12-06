@@ -1,0 +1,18 @@
+# Core inference dependencies
+torch>=2.0.0
+transformers>=4.40.0
+accelerate>=0.27.0
+
+# Image processing
+Pillow>=10.0.0
+
+# Web server
+fastapi>=0.109.0
+uvicorn>=0.27.0
+pydantic>=2.0.0
+
+# Qwen2-VL specific (may need flash-attn for optimal performance)
+# flash-attn>=2.5.0  # Optional, install separately if needed
+
+# For development/debugging
+python-multipart>=0.0.6

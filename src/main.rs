@@ -9,6 +9,7 @@ mod validation;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use indicatif::{ProgressBar, ProgressStyle};
 use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
@@ -142,6 +143,15 @@ fn process_command(
 
     println!("Found {} PDF(s) to process", pdfs.len());
 
+    // Create progress bar
+    let progress = ProgressBar::new(pdfs.len() as u64);
+    progress.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
+            .expect("Invalid progress bar template")
+            .progress_chars("#>-")
+    );
+
     // Create inference client
     let client = InferenceClient::new(&config.inference.server_url)
         .context("Failed to create inference client")?;
@@ -175,7 +185,8 @@ fn process_command(
             .and_then(|s| s.to_str())
             .unwrap_or("unknown");
 
-        println!("\nProcessing: {}", pdf_path.display());
+        progress.set_message(filename.to_string());
+        progress.println(format!("\nProcessing: {}", pdf_path.display()));
 
         // Try processing with retries
         let result = process_with_retry(&client, &config, pdf_path, max_retries);
@@ -204,28 +215,28 @@ fn process_command(
                 output::write_json(&extraction, &json_path)?;
 
                 // Report results
-                println!("  Confidence: {:.0}% (header: {:.0}%, line items: {:.0}%)",
+                progress.println(format!("  Confidence: {:.0}% (header: {:.0}%, line items: {:.0}%)",
                     extraction.confidence.overall * 100.0,
                     extraction.confidence.header * 100.0,
                     extraction.confidence.line_items * 100.0
-                );
-                println!("  Extracted {} line items", extraction.line_items.len());
+                ));
+                progress.println(format!("  Extracted {} line items", extraction.line_items.len()));
 
                 if extraction.confidence.overall < config.output.confidence_threshold {
-                    println!("  [LOW CONFIDENCE] - flagged for review");
+                    progress.println("  [LOW CONFIDENCE] - flagged for review".to_string());
                 }
 
                 if !extraction.warnings.is_empty() {
                     let error_count = errors.iter().filter(|e| e.severity == Severity::Error).count();
                     let warning_count = errors.iter().filter(|e| e.severity == Severity::Warning).count();
-                    println!("  Validation: {} error(s), {} warning(s)", error_count, warning_count);
+                    progress.println(format!("  Validation: {} error(s), {} warning(s)", error_count, warning_count));
                 }
 
                 // Archive if configured
                 if config.processing.archive_processed {
                     match archive_file(pdf_path, &config.processing.archive_dir) {
                         Ok(archive_path) => {
-                            println!("  Archived to: {}", archive_path.display());
+                            progress.println(format!("  Archived to: {}", archive_path.display()));
                         }
                         Err(e) => {
                             tracing::warn!("Failed to archive {}: {}", pdf_path.display(), e);
@@ -237,12 +248,16 @@ fn process_command(
                 extractions.push(extraction);
             }
             Err(e) => {
-                println!("  FAILED: {}", e);
+                progress.println(format!("  FAILED: {}", e));
                 tracing::error!("Failed to process {}: {:?}", pdf_path.display(), e);
                 summary.record_failure(filename, &e.to_string());
             }
         }
+
+        progress.inc(1);
     }
+
+    progress.finish_with_message("Processing complete");
 
     // Write batch outputs if needed
     if !extractions.is_empty() {

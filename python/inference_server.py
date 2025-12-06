@@ -3,17 +3,19 @@
 Invoice OCR Inference Server
 
 FastAPI server that handles model loading and inference requests from the Rust CLI.
+Supports multiple model backends with hot-swapping capability.
 """
 
 import json
-import re
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import uvicorn
+
+from models import get_handler, list_available_models, DEFAULT_MODEL, ModelHandler
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -22,10 +24,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="Invoice OCR Inference Server")
 
 # Global model state
-model = None
-processor = None
-model_name: Optional[str] = None
-device: Optional[str] = None
+current_handler: Optional[ModelHandler] = None
 
 
 class InferenceRequest(BaseModel):
@@ -46,37 +45,14 @@ class StatusResponse(BaseModel):
     device: Optional[str] = None
 
 
-def load_model(name: str = "Qwen/Qwen2-VL-7B-Instruct"):
-    """Load the multimodal model."""
-    global model, processor, model_name, device
+class ModelInfo(BaseModel):
+    name: str
+    requires_vram_gb: float
 
-    if model is not None:
-        logger.info(f"Model already loaded: {model_name}")
-        return
 
-    logger.info(f"Loading model: {name}")
-
-    import torch
-    from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
-
-    # Determine device
-    if torch.cuda.is_available():
-        device = "cuda:0"
-        dtype = torch.float16
-    else:
-        device = "cpu"
-        dtype = torch.float32
-        logger.warning("CUDA not available, using CPU (will be slow)")
-
-    processor = AutoProcessor.from_pretrained(name)
-    model = Qwen2VLForConditionalGeneration.from_pretrained(
-        name,
-        torch_dtype=dtype,
-        device_map=device,
-    )
-
-    model_name = name
-    logger.info(f"Model loaded on {device}")
+class ModelsResponse(BaseModel):
+    models: List[ModelInfo]
+    current: Optional[str] = None
 
 
 def parse_json_response(text: str) -> dict:
@@ -85,9 +61,7 @@ def parse_json_response(text: str) -> dict:
 
     # Remove markdown code blocks
     if text.startswith("```"):
-        # Find the end of the code block
         lines = text.split("\n")
-        # Skip first line (```json or ```)
         start_idx = 1
         end_idx = len(lines)
         for i in range(len(lines) - 1, 0, -1):
@@ -97,63 +71,47 @@ def parse_json_response(text: str) -> dict:
         text = "\n".join(lines[start_idx:end_idx])
 
     text = text.strip()
-
-    # Try to parse
     return json.loads(text)
+
+
+def load_model(name: str = DEFAULT_MODEL) -> None:
+    """Load a model, unloading any currently loaded model first."""
+    global current_handler
+
+    # Check if same model already loaded
+    if current_handler is not None and current_handler.name == name:
+        logger.info(f"Model already loaded: {name}")
+        return
+
+    # Unload current model if different
+    if current_handler is not None:
+        logger.info(f"Switching models: {current_handler.name} -> {name}")
+        current_handler.unload()
+        current_handler = None
+
+    # Load new model
+    handler = get_handler(name)
+    handler.load()
+    current_handler = handler
 
 
 def extract_from_image(image_path: str, prompt: str) -> dict:
     """Run extraction on an image."""
-    global model, processor
+    global current_handler
 
-    if model is None:
+    if current_handler is None:
         load_model()
 
     from PIL import Image
 
-    # Load image
     image = Image.open(image_path)
 
-    # Construct messages
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image", "image": image},
-                {"type": "text", "text": prompt},
-            ],
-        }
-    ]
-
-    # Prepare inputs
-    text = processor.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
-
-    inputs = processor(
-        text=[text],
-        images=[image],
-        return_tensors="pt",
-    ).to(model.device)
-
-    # Generate
-    outputs = model.generate(
-        **inputs,
-        max_new_tokens=4096,
-        temperature=0.1,
-        do_sample=False,
-    )
-
-    # Decode response
-    response = processor.batch_decode(
-        outputs[:, inputs.input_ids.shape[1] :],
-        skip_special_tokens=True,
-    )[0]
-
-    logger.debug(f"Raw model response: {response[:500]}...")
+    # Get raw response from model
+    raw_response = current_handler.extract(image, prompt)
+    logger.debug(f"Raw model response: {raw_response[:500]}...")
 
     # Parse JSON
-    return parse_json_response(response)
+    return parse_json_response(raw_response)
 
 
 @app.get("/status", response_model=StatusResponse)
@@ -161,9 +119,22 @@ async def get_status():
     """Check server status and model state."""
     return StatusResponse(
         status="ok",
-        model_loaded=model is not None,
-        model_name=model_name,
-        device=device,
+        model_loaded=current_handler is not None and current_handler.is_loaded,
+        model_name=current_handler.name if current_handler else None,
+        device=current_handler.device_info if current_handler else None,
+    )
+
+
+@app.get("/models", response_model=ModelsResponse)
+async def get_models():
+    """List available models."""
+    models = [
+        ModelInfo(name=m["name"], requires_vram_gb=m["requires_vram_gb"])
+        for m in list_available_models()
+    ]
+    return ModelsResponse(
+        models=models,
+        current=current_handler.name if current_handler else None,
     )
 
 
@@ -171,14 +142,11 @@ async def get_status():
 async def extract(request: InferenceRequest):
     """Extract invoice data from an image."""
     try:
-        # Validate image path
         image_path = Path(request.image_path)
         if not image_path.exists():
             raise HTTPException(status_code=400, detail=f"Image not found: {image_path}")
 
-        # Run extraction
         data = extract_from_image(str(image_path), request.prompt)
-
         return InferenceResponse(success=True, data=data)
 
     except json.JSONDecodeError as e:
@@ -193,14 +161,35 @@ async def extract(request: InferenceRequest):
 
 
 @app.post("/load")
-async def load(model_name: str = "Qwen/Qwen2-VL-7B-Instruct"):
-    """Explicitly load a model."""
+async def load(model_name: str = DEFAULT_MODEL):
+    """Load a specific model (unloads current model first)."""
     try:
         load_model(model_name)
-        return {"status": "ok", "model": model_name}
+        return {
+            "status": "ok",
+            "model": current_handler.name,
+            "device": current_handler.device_info,
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.exception("Failed to load model")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/unload")
+async def unload():
+    """Unload the current model to free memory."""
+    global current_handler
+
+    if current_handler is None:
+        return {"status": "ok", "message": "No model loaded"}
+
+    model_name = current_handler.name
+    current_handler.unload()
+    current_handler = None
+
+    return {"status": "ok", "message": f"Unloaded {model_name}"}
 
 
 if __name__ == "__main__":
@@ -212,8 +201,8 @@ if __name__ == "__main__":
     parser.add_argument("--preload", action="store_true", help="Preload model on startup")
     parser.add_argument(
         "--model",
-        default="Qwen/Qwen2-VL-7B-Instruct",
-        help="Model to use",
+        default=DEFAULT_MODEL,
+        help="Model to use (default: Qwen/Qwen2-VL-7B-Instruct)",
     )
 
     args = parser.parse_args()

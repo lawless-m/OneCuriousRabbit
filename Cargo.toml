@@ -1,0 +1,42 @@
+[package]
+name = "invoice-ocr"
+version = "0.1.0"
+edition = "2021"
+description = "Local invoice extraction system using multimodal LLMs"
+
+[dependencies]
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Configuration
+toml = "0.8"
+
+# CSV output
+csv = "1"
+
+# Excel output
+rust_xlsxwriter = "0.79"
+
+# Date/time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# HTTP client for inference server
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Progress bars
+indicatif = "0.17"
+
+# File watching
+notify = "6"

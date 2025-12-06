@@ -202,7 +202,7 @@ fn validate_line_items(items: &[LineItem]) -> Vec<ValidationError> {
 
         // Check VAT rate is reasonable
         if let Some(vat_rate) = item.vat_rate {
-            if vat_rate < 0.0 || vat_rate > 100.0 {
+            if !(0.0..=100.0).contains(&vat_rate) {
                 errors.push(ValidationError {
                     field: format!("{}.vat_rate", prefix),
                     message: format!("Line {} has unusual VAT rate: {}%", item.line_number, vat_rate),
@@ -336,7 +336,7 @@ fn is_valid_date(date: &str) -> bool {
 
     match (year, month, day) {
         (Ok(y), Ok(m), Ok(d)) => {
-            y >= 1900 && y <= 2100 && m >= 1 && m <= 12 && d >= 1 && d <= 31
+            (1900..=2100).contains(&y) && (1..=12).contains(&m) && (1..=31).contains(&d)
         }
         _ => false,
     }

@@ -90,7 +90,7 @@ impl InvoiceExtraction {
             extracted_at: now,
             model_used,
             confidence: Confidence {
-                overall: 0.0,  // To be calculated
+                overall: 0.0,
                 header: 0.0,
                 line_items: 0.0,
             },
@@ -101,43 +101,69 @@ impl InvoiceExtraction {
         }
     }
 
-    /// Validate the extraction and populate warnings
-    pub fn validate(&mut self) {
-        // Check if line items sum to net total
-        let line_sum: f64 = self.line_items.iter().map(|l| l.line_total).sum();
-        let tolerance = 0.01;
+    /// Merge line items from a continuation page
+    pub fn merge_continuation(&mut self, continuation: ContinuationExtraction) {
+        if continuation.continuation {
+            self.line_items.extend(continuation.additional_items);
+        }
+    }
 
-        if (line_sum - self.header.net_total).abs() > tolerance {
-            self.warnings.push(format!(
-                "Line items sum ({:.2}) does not match net total ({:.2})",
-                line_sum, self.header.net_total
-            ));
-        }
+    /// Get the last line number (for continuation pages)
+    pub fn last_line_number(&self) -> u32 {
+        self.line_items.last().map(|l| l.line_number).unwrap_or(0)
+    }
+}
 
-        // Check if net + VAT = gross
-        let calculated_gross = self.header.net_total + self.header.vat_amount;
-        if (calculated_gross - self.header.gross_total).abs() > tolerance {
-            self.warnings.push(format!(
-                "Net ({:.2}) + VAT ({:.2}) = {:.2} does not match gross total ({:.2})",
-                self.header.net_total, self.header.vat_amount,
-                calculated_gross, self.header.gross_total
-            ));
-        }
+/// Batch processing summary
+#[derive(Debug, Clone, Default)]
+pub struct ProcessingSummary {
+    pub total_files: usize,
+    pub successful: usize,
+    pub failed: usize,
+    pub low_confidence: usize,
+    pub with_warnings: usize,
+    pub total_line_items: usize,
+    pub errors: Vec<(String, String)>, // (filename, error message)
+}
 
-        // Check for missing required fields
-        if self.header.supplier_name.is_empty() {
-            self.warnings.push("Missing supplier name".to_string());
-        }
-        if self.header.invoice_number.is_empty() {
-            self.warnings.push("Missing invoice number".to_string());
-        }
-        if self.header.invoice_date.is_empty() {
-            self.warnings.push("Missing invoice date".to_string());
-        }
+impl ProcessingSummary {
+    pub fn new() -> Self {
+        Self::default()
+    }
 
-        // Calculate simple confidence based on warnings
-        self.confidence.header = if self.warnings.is_empty() { 0.95 } else { 0.7 };
-        self.confidence.line_items = if self.line_items.is_empty() { 0.0 } else { 0.9 };
-        self.confidence.overall = (self.confidence.header + self.confidence.line_items) / 2.0;
+    pub fn record_success(&mut self, extraction: &InvoiceExtraction, threshold: f64) {
+        self.successful += 1;
+        self.total_line_items += extraction.line_items.len();
+
+        if extraction.confidence.overall < threshold {
+            self.low_confidence += 1;
+        }
+        if !extraction.warnings.is_empty() {
+            self.with_warnings += 1;
+        }
+    }
+
+    pub fn record_failure(&mut self, filename: &str, error: &str) {
+        self.failed += 1;
+        self.errors.push((filename.to_string(), error.to_string()));
+    }
+
+    pub fn print_summary(&self) {
+        println!("\n{}", "=".repeat(50));
+        println!("Processing Summary");
+        println!("{}", "=".repeat(50));
+        println!("Total files:      {}", self.total_files);
+        println!("Successful:       {}", self.successful);
+        println!("Failed:           {}", self.failed);
+        println!("Low confidence:   {}", self.low_confidence);
+        println!("With warnings:    {}", self.with_warnings);
+        println!("Total line items: {}", self.total_line_items);
+
+        if !self.errors.is_empty() {
+            println!("\nFailed files:");
+            for (filename, error) in &self.errors {
+                println!("  {} - {}", filename, error);
+            }
+        }
     }
 }

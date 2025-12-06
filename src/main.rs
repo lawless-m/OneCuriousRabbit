@@ -5,14 +5,24 @@ mod inference;
 mod output;
 mod pdf;
 mod types;
+mod validation;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use std::thread;
+use std::time::Duration;
 
 use config::{Config, OutputFormat};
 use inference::InferenceClient;
-use types::InvoiceExtraction;
+use types::{InvoiceExtraction, ProcessingSummary};
+use validation::{calculate_confidence, validate_extraction, Severity};
+
+/// Maximum number of retries for failed extractions
+const MAX_RETRIES: u32 = 2;
+
+/// Delay between retries in milliseconds
+const RETRY_DELAY_MS: u64 = 1000;
 
 #[derive(Parser)]
 #[command(name = "invoice-ocr")]
@@ -45,6 +55,14 @@ enum Commands {
         /// Model to use for extraction
         #[arg(short, long)]
         model: Option<String>,
+
+        /// Skip archiving processed files
+        #[arg(long)]
+        no_archive: bool,
+
+        /// Number of retries for failed extractions
+        #[arg(long, default_value = "2")]
+        retries: u32,
     },
 
     /// Check system and server status
@@ -76,8 +94,8 @@ fn main() -> Result<()> {
     };
 
     match cli.command {
-        Commands::Process { path, all, format, model: _ } => {
-            process_command(config, path, all, format)
+        Commands::Process { path, all, format, model: _, no_archive, retries } => {
+            process_command(config, path, all, format, no_archive, retries)
         }
         Commands::Status => status_command(config),
         Commands::Models => models_command(),
@@ -91,10 +109,17 @@ fn process_command(
     path: Option<PathBuf>,
     all: bool,
     format: Option<OutputFormat>,
+    no_archive: bool,
+    max_retries: u32,
 ) -> Result<()> {
     // Override format if specified
     if let Some(fmt) = format {
         config.output.format = fmt;
+    }
+
+    // Override archive setting if --no-archive specified
+    if no_archive {
+        config.processing.archive_processed = false;
     }
 
     // Collect PDFs to process
@@ -138,14 +163,36 @@ fn process_command(
         }
     }
 
+    // Initialize processing summary
+    let mut summary = ProcessingSummary::new();
+    summary.total_files = pdfs.len();
+
     // Process each PDF
     let mut extractions: Vec<InvoiceExtraction> = Vec::new();
 
     for pdf_path in &pdfs {
+        let filename = pdf_path.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown");
+
         println!("\nProcessing: {}", pdf_path.display());
 
-        match process_single_pdf(&client, &config, pdf_path) {
-            Ok(extraction) => {
+        // Try processing with retries
+        let result = process_with_retry(&client, &config, pdf_path, max_retries);
+
+        match result {
+            Ok(mut extraction) => {
+                // Validate and calculate confidence
+                let errors = validate_extraction(&extraction);
+                extraction.confidence = calculate_confidence(&extraction, &errors);
+
+                // Add validation errors as warnings
+                for error in &errors {
+                    if error.severity != Severity::Info {
+                        extraction.warnings.push(format!("{}: {}", error.field, error.message));
+                    }
+                }
+
                 // Write individual JSON output
                 let output_name = pdf_path
                     .file_stem()
@@ -156,43 +203,49 @@ fn process_command(
                 std::fs::create_dir_all(&config.processing.output_dir)?;
                 output::write_json(&extraction, &json_path)?;
 
-                // Check confidence
+                // Report results
+                println!("  Confidence: {:.0}% (header: {:.0}%, line items: {:.0}%)",
+                    extraction.confidence.overall * 100.0,
+                    extraction.confidence.header * 100.0,
+                    extraction.confidence.line_items * 100.0
+                );
+                println!("  Extracted {} line items", extraction.line_items.len());
+
                 if extraction.confidence.overall < config.output.confidence_threshold {
-                    println!(
-                        "  Low confidence ({:.0}%) - flagged for review",
-                        extraction.confidence.overall * 100.0
-                    );
+                    println!("  [LOW CONFIDENCE] - flagged for review");
                 }
 
                 if !extraction.warnings.is_empty() {
-                    println!("  Warnings:");
-                    for warning in &extraction.warnings {
-                        println!("    - {}", warning);
-                    }
+                    let error_count = errors.iter().filter(|e| e.severity == Severity::Error).count();
+                    let warning_count = errors.iter().filter(|e| e.severity == Severity::Warning).count();
+                    println!("  Validation: {} error(s), {} warning(s)", error_count, warning_count);
                 }
 
                 // Archive if configured
                 if config.processing.archive_processed {
-                    let archive_path = config.processing.archive_dir.join(
-                        pdf_path.file_name().unwrap_or_default()
-                    );
-                    std::fs::create_dir_all(&config.processing.archive_dir)?;
-                    std::fs::rename(pdf_path, &archive_path)
-                        .with_context(|| format!("Failed to archive {}", pdf_path.display()))?;
-                    println!("  Archived to: {}", archive_path.display());
+                    match archive_file(pdf_path, &config.processing.archive_dir) {
+                        Ok(archive_path) => {
+                            println!("  Archived to: {}", archive_path.display());
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to archive {}: {}", pdf_path.display(), e);
+                        }
+                    }
                 }
 
+                summary.record_success(&extraction, config.output.confidence_threshold);
                 extractions.push(extraction);
             }
             Err(e) => {
-                println!("  Failed: {}", e);
+                println!("  FAILED: {}", e);
                 tracing::error!("Failed to process {}: {:?}", pdf_path.display(), e);
+                summary.record_failure(filename, &e.to_string());
             }
         }
     }
 
     // Write batch outputs if needed
-    if extractions.len() > 1 || config.output.format != OutputFormat::Json {
+    if !extractions.is_empty() {
         match config.output.format {
             OutputFormat::Csv | OutputFormat::Both => {
                 let csv_path = config.processing.output_dir.join("invoices.csv");
@@ -210,9 +263,37 @@ fn process_command(
         }
     }
 
-    println!("\nProcessed {} invoice(s)", extractions.len());
+    // Print summary
+    summary.print_summary();
 
     Ok(())
+}
+
+/// Process a PDF with retry logic
+fn process_with_retry(
+    client: &InferenceClient,
+    config: &Config,
+    pdf_path: &PathBuf,
+    max_retries: u32,
+) -> Result<InvoiceExtraction> {
+    let mut last_error = None;
+
+    for attempt in 0..=max_retries {
+        if attempt > 0 {
+            println!("  Retry {}/{}...", attempt, max_retries);
+            thread::sleep(Duration::from_millis(RETRY_DELAY_MS * attempt as u64));
+        }
+
+        match process_single_pdf(client, config, pdf_path) {
+            Ok(extraction) => return Ok(extraction),
+            Err(e) => {
+                tracing::warn!("Attempt {} failed: {}", attempt + 1, e);
+                last_error = Some(e);
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Unknown error")))
 }
 
 /// Process a single PDF file
@@ -221,21 +302,43 @@ fn process_single_pdf(
     config: &Config,
     pdf_path: &PathBuf,
 ) -> Result<InvoiceExtraction> {
+    // Validate PDF exists and is readable
+    if !pdf_path.exists() {
+        anyhow::bail!("File not found: {}", pdf_path.display());
+    }
+
+    // Check file size (basic corruption check)
+    let metadata = std::fs::metadata(pdf_path)
+        .with_context(|| format!("Cannot read file: {}", pdf_path.display()))?;
+
+    if metadata.len() == 0 {
+        anyhow::bail!("File is empty: {}", pdf_path.display());
+    }
+
     // Create temp directory for images
     let temp_dir = pdf::create_temp_dir("invoice-ocr")?;
 
-    // Convert PDF to images
-    let images = pdf::pdf_to_images(
+    // Convert PDF to images with error handling
+    let images = match pdf::pdf_to_images(
         pdf_path,
         &temp_dir,
         config.processing.image_dpi,
         &config.processing.image_format,
-    )?;
+    ) {
+        Ok(imgs) => imgs,
+        Err(e) => {
+            // Cleanup on failure
+            let _ = pdf::cleanup_temp_dir(&temp_dir);
+            return Err(e.context("PDF conversion failed - file may be corrupt or password-protected"));
+        }
+    };
 
     println!("  Converted to {} page(s)", images.len());
 
     // Extract from first page (main extraction)
-    let raw_extraction = client.extract(&images[0])?;
+    let raw_extraction = client.extract(&images[0])
+        .context("Failed to extract from first page")?;
+
     let mut extraction = InvoiceExtraction::from_raw(
         raw_extraction,
         pdf_path.file_name()
@@ -247,38 +350,50 @@ fn process_single_pdf(
 
     // Handle multi-page invoices
     if images.len() > 1 {
-        let mut last_line = extraction.line_items
-            .last()
-            .map(|l| l.line_number)
-            .unwrap_or(0);
-
         for (i, image) in images.iter().enumerate().skip(1) {
             println!("  Processing page {}...", i + 1);
 
+            let last_line = extraction.last_line_number();
+
             match client.extract_continuation(image, (i + 1) as u32, last_line) {
                 Ok(continuation) => {
-                    if continuation.continuation {
-                        for item in continuation.additional_items {
-                            last_line = item.line_number;
-                            extraction.line_items.push(item);
-                        }
-                    }
+                    extraction.merge_continuation(continuation);
                 }
                 Err(e) => {
                     tracing::warn!("Failed to extract page {}: {}", i + 1, e);
-                    extraction.warnings.push(format!("Page {} extraction failed", i + 1));
+                    extraction.warnings.push(format!("Page {} extraction failed: {}", i + 1, e));
                 }
             }
         }
     }
 
-    // Validate extraction
-    extraction.validate();
-
     // Cleanup temp directory
     pdf::cleanup_temp_dir(&temp_dir)?;
 
     Ok(extraction)
+}
+
+/// Archive a file to the archive directory
+fn archive_file(source: &PathBuf, archive_dir: &PathBuf) -> Result<PathBuf> {
+    std::fs::create_dir_all(archive_dir)?;
+
+    let filename = source.file_name()
+        .ok_or_else(|| anyhow::anyhow!("Invalid filename"))?;
+
+    let mut archive_path = archive_dir.join(filename);
+
+    // Handle duplicate filenames
+    if archive_path.exists() {
+        let stem = source.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
+        let ext = source.extension().and_then(|s| s.to_str()).unwrap_or("pdf");
+        let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+        archive_path = archive_dir.join(format!("{}_{}.{}", stem, timestamp, ext));
+    }
+
+    std::fs::rename(source, &archive_path)
+        .with_context(|| format!("Failed to move {} to {}", source.display(), archive_path.display()))?;
+
+    Ok(archive_path)
 }
 
 /// Collect all PDF files from a directory

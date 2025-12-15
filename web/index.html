@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Invoice OCR</title>
+    <script src="https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js"></script>
     <style>
         * {
             box-sizing: border-box;
@@ -172,6 +173,14 @@
             color: #2563eb;
             cursor: pointer;
             text-decoration: underline;
+            margin-right: 1rem;
+        }
+
+        .download-btn {
+            font-size: 0.75rem;
+            color: #059669;
+            cursor: pointer;
+            text-decoration: underline;
         }
 
         .error-message {
@@ -234,10 +243,8 @@
             </div>
         </div>
 
-        <div class="settings">
-            <label for="serverUrl">Server URL</label>
-            <input type="text" id="serverUrl" value="http://127.0.0.1:8765" onchange="checkStatus()">
-        </div>
+        <!-- Server URL hidden - using relative paths for reverse proxy -->
+        <input type="hidden" id="serverUrl" value="api">
 
         <div class="drop-zone" id="dropZone">
             <div class="drop-icon">📄</div>
@@ -258,6 +265,7 @@
         const fileInput = document.getElementById('fileInput');
         const results = document.getElementById('results');
         const resultsList = document.getElementById('resultsList');
+        const extractionData = {}; // Store extraction results for download
 
         function getServerUrl() {
             return document.getElementById('serverUrl').value.trim();
@@ -271,22 +279,22 @@
             const modelName = document.getElementById('modelName');
 
             try {
-                const res = await fetch(`${getServerUrl()}/status`);
+                const res = await fetch(`${getServerUrl()}/status`, { timeout: 5000 });
                 const data = await res.json();
 
                 statusDot.className = 'status-dot connected';
-                statusText.textContent = 'Server connected';
+                statusText.textContent = 'Ready';
 
                 if (data.model_loaded) {
                     modelInfo.style.display = 'block';
                     modelName.textContent = data.model_name || 'Loaded';
                 } else {
                     modelInfo.style.display = 'block';
-                    modelName.textContent = 'Not loaded (will load on first request)';
+                    modelName.textContent = 'Will load on first upload (~30s)';
                 }
             } catch (e) {
                 statusDot.className = 'status-dot error';
-                statusText.textContent = 'Server not connected';
+                statusText.textContent = '⚠️ Server offline or not properly configured';
                 modelInfo.style.display = 'none';
             }
         }
@@ -365,7 +373,13 @@
                     updateResult(itemId, file.name, { error: data.error }, false);
                 }
             } catch (e) {
-                updateResult(itemId, file.name, { error: e.message }, false);
+                let errorMsg = e.message;
+                if (e.message.includes('Failed to fetch')) {
+                    errorMsg = 'Server not responding - check if inference server is running at ' + getServerUrl();
+                } else if (e.message.includes('NetworkError')) {
+                    errorMsg = 'Network error - cannot reach server at ' + getServerUrl();
+                }
+                updateResult(itemId, file.name, { error: errorMsg }, false);
             }
 
             dropZone.classList.remove('processing');
@@ -384,14 +398,17 @@
             const item = document.getElementById(itemId);
 
             if (success && data.header) {
-                const confidence = data.confidence?.overall || 0;
-                const confidenceClass = confidence < 0.7 ? 'low' : '';
+                // Store extraction data for download
+                extractionData[itemId] = { filename, data };
+                const confidence = data.confidence?.overall;
+                const confidenceClass = confidence && confidence < 0.7 ? 'low' : '';
+                const confidenceText = confidence ? `${(confidence * 100).toFixed(0)}% confidence` : '';
                 const lineCount = data.line_items?.length || 0;
 
                 item.innerHTML = `
                     <div class="result-header">
                         <span class="result-filename">${filename}</span>
-                        <span class="result-confidence ${confidenceClass}">${(confidence * 100).toFixed(0)}% confidence</span>
+                        ${confidenceText ? `<span class="result-confidence ${confidenceClass}">${confidenceText}</span>` : ''}
                     </div>
                     <div class="result-details">
                         <strong>${data.header.supplier_name || 'Unknown'}</strong> -
@@ -399,15 +416,30 @@
                         ${data.header.currency || ''} ${data.header.gross_total?.toFixed(2) || '0.00'} -
                         ${lineCount} line item${lineCount !== 1 ? 's' : ''}
                         <span class="toggle-json" onclick="toggleJson('${itemId}')">Show JSON</span>
+                        <span class="download-btn" onclick="downloadExcel('${itemId}', '${filename}')">Download Excel</span>
                     </div>
                     <pre class="result-json" id="json-${itemId}">${JSON.stringify(data, null, 2)}</pre>
                 `;
             } else {
+                let errorDetails = data.error || 'Unknown error';
+                let helpText = '';
+
+                if (errorDetails.includes('Server not responding')) {
+                    helpText = '<br><small>The backend inference server is not responding. Check server logs.</small>';
+                } else if (errorDetails.includes('out of memory') || errorDetails.includes('OOM')) {
+                    helpText = '<br><small>GPU is busy with another task. Wait a moment and try again.</small>';
+                } else if (errorDetails.includes('timeout')) {
+                    helpText = '<br><small>Model is loading (may take 30-60 seconds on first request).</small>';
+                }
+
                 item.innerHTML = `
                     <div class="result-header">
                         <span class="result-filename">${filename}</span>
                     </div>
-                    <div class="error-message">Error: ${data.error || 'Unknown error'}</div>
+                    <div class="error-message">
+                        ${errorDetails}
+                        ${helpText}
+                    </div>
                 `;
             }
         }
@@ -417,13 +449,70 @@
             json.classList.toggle('show');
         }
 
+        function downloadExcel(itemId, filename) {
+            const extraction = extractionData[itemId];
+            if (!extraction) return;
+
+            const { data } = extraction;
+
+            // Create workbook
+            const wb = XLSX.utils.book_new();
+
+            // Header sheet
+            const headerData = [
+                ['Field', 'Value'],
+                ['Supplier', data.header.supplier_name || ''],
+                ['Customer', data.header.customer_name || ''],
+                ['Invoice Number', data.header.invoice_number || ''],
+                ['Invoice Date', data.header.invoice_date || ''],
+                ['PO Reference', data.header.po_reference || ''],
+                ['Currency', data.header.currency || ''],
+                ['Net Total', data.header.net_total || 0],
+                ['VAT Amount', data.header.vat_amount || 0],
+                ['Gross Total', data.header.gross_total || 0],
+                ['Payment Due Date', data.header.payment_due_date || '']
+            ];
+            const wsHeader = XLSX.utils.aoa_to_sheet(headerData);
+            XLSX.utils.book_append_sheet(wb, wsHeader, 'Header');
+
+            // Line items sheet
+            if (data.line_items && data.line_items.length > 0) {
+                const lineItemsData = [
+                    ['Line', 'Product Code', 'Description', 'Quantity', 'Unit', 'Unit Price', 'VAT Rate', 'Line Total']
+                ];
+                data.line_items.forEach(item => {
+                    lineItemsData.push([
+                        item.line_number || '',
+                        item.product_code || '',
+                        item.description || '',
+                        item.quantity || 0,
+                        item.unit || '',
+                        item.unit_price || 0,
+                        item.vat_rate || '',
+                        item.line_total || 0
+                    ]);
+                });
+                const wsLineItems = XLSX.utils.aoa_to_sheet(lineItemsData);
+                XLSX.utils.book_append_sheet(wb, wsLineItems, 'Line Items');
+            }
+
+            // Download
+            const excelFilename = filename.replace(/\.[^/.]+$/, '') + '.xlsx';
+            XLSX.writeFile(wb, excelFilename);
+        }
+
         function getDefaultPrompt() {
             return `You are an invoice data extraction system. Extract all relevant information from this invoice image and return it as valid JSON.
+
+CRITICAL: This invoice is being received BY "S D Ramsden & Co Ltd" (also known as "Ramsden International").
+They are the CUSTOMER/BUYER, NOT the supplier.
+The supplier_name must be the OTHER company - the one SENDING/ISSUING the invoice TO Ramsden.
 
 Extract the following information:
 
 HEADER FIELDS:
-- supplier_name: The company issuing the invoice
+- supplier_name: The company SENDING this invoice (the vendor/seller) - NOT Ramsden
+- customer_name: The company RECEIVING this invoice (will be S D Ramsden & Co Ltd or Ramsden International)
 - invoice_number: The unique invoice identifier
 - invoice_date: Date the invoice was issued (format: YYYY-MM-DD)
 - po_reference: Purchase order number if present (null if not found)

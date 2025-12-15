@@ -1,0 +1,30 @@
+# Nginx reverse proxy configuration for Invoice OCR
+# Add this to your nginx site config
+
+# Frontend - Static HTML
+location /rabbit/ {
+    alias /home/matt/Git/OneCuriousRabbit/web/;
+    try_files $uri $uri/ /rabbit/index.html;
+
+    # Optional: Cache static assets
+    add_header Cache-Control "public, max-age=3600";
+}
+
+# Backend API - Proxy to inference server
+location /rabbit/api/ {
+    # Remove /rabbit/api prefix, forward to inference server
+    rewrite ^/rabbit/api/(.*)$ /$1 break;
+
+    proxy_pass http://10.99.0.3:8765;
+    proxy_http_version 1.1;
+
+    # Important for large PDF uploads
+    client_max_body_size 50M;
+    proxy_read_timeout 120s;  # Model loading can take time
+
+    # Proxy headers
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}

@@ -89,7 +89,7 @@ format = "json"
 confidence_threshold = 0.7
 
 [inference]
-server_url = "http://127.0.0.1:8765"
+server_url = "http://10.99.0.3:8765"
 ```
 
 ## Usage
@@ -193,6 +193,54 @@ Install poppler-utils (see System Dependencies above)
 ### CUDA out of memory
 - Use smaller model (Qwen2-VL-2B)
 - Enable int8 quantization in Python server
+
+## Web Interface
+
+A drag-and-drop web interface is available at `web/index.html` with features:
+- PDF and image upload
+- Real-time extraction results
+- Excel download (Header + Line Items sheets)
+- Automatic status monitoring
+
+### Deployment via Nginx
+
+The inference server runs on port 8765. Configure nginx to serve the frontend and proxy API requests:
+
+```bash
+# Inference server runs on its own port
+python python/inference_server.py  # Runs on 10.99.0.3:8765
+```
+
+See `nginx.conf.example` for reverse proxy configuration.
+
+## GPU Memory Management
+
+This service implements two-layer GPU coordination:
+
+### 1. OOM Retry (Always Active)
+- Automatically retries 3 times with 30s delays on CUDA OOM errors
+- Works with any service that auto-unloads (like Ollama with OLLAMA_KEEP_ALIVE=30s)
+- No coordination required
+
+### 2. Service Signaling (Optional)
+The inference server implements endpoints for active coordination:
+
+- **Auto-unload on idle**: `--auto-unload-minutes 5` unloads model after 5 minutes of inactivity
+- **Request-unload endpoint**: `POST http://10.99.0.3:8765/request-unload` - other services can request unload if idle
+- **Enhanced status**: `/status` shows idle time and auto-unload configuration
+
+**Before loading a large model in another service:**
+```bash
+# Request Invoice OCR to unload if idle
+python request_gpu_unload.py
+
+# Or directly via curl
+curl -X POST http://10.99.0.3:8765/request-unload
+```
+
+This gives faster, more predictable GPU coordination with OOM retry as fallback.
+
+See `/home/matt/Git/claude-skills/.claude/skills/Vram-GPU-OOM-memory-management/SKILL.md` for implementing this pattern in other GPU services.
 
 ## License
 

@@ -6,11 +6,13 @@ FastAPI server that handles model loading and inference requests from the Rust C
 Supports multiple model backends with hot-swapping capability.
 """
 
+import asyncio
 import base64
 import io
 import json
 import logging
 import tempfile
+import time
 from pathlib import Path
 from typing import Optional, List
 
@@ -38,6 +40,8 @@ app.add_middleware(
 
 # Global model state
 current_handler: Optional[ModelHandler] = None
+last_request_time: Optional[float] = None
+auto_unload_minutes: Optional[int] = None  # None = disabled
 
 
 class InferenceRequest(BaseModel):
@@ -62,6 +66,9 @@ class StatusResponse(BaseModel):
     model_loaded: bool
     model_name: Optional[str] = None
     device: Optional[str] = None
+    idle_seconds: Optional[float] = None
+    auto_unload_enabled: bool = False
+    auto_unload_minutes: Optional[int] = None
 
 
 class ModelInfo(BaseModel):
@@ -72,6 +79,37 @@ class ModelInfo(BaseModel):
 class ModelsResponse(BaseModel):
     models: List[ModelInfo]
     current: Optional[str] = None
+
+
+def update_last_request_time() -> None:
+    """Update the timestamp of the last request."""
+    global last_request_time
+    last_request_time = time.time()
+
+
+def get_idle_seconds() -> Optional[float]:
+    """Get seconds since last request, or None if never used."""
+    if last_request_time is None:
+        return None
+    return time.time() - last_request_time
+
+
+async def auto_unload_task():
+    """Background task that unloads model after idle timeout."""
+    global current_handler
+
+    while True:
+        await asyncio.sleep(60)  # Check every minute
+
+        if auto_unload_minutes is None or current_handler is None:
+            continue
+
+        idle = get_idle_seconds()
+        if idle is not None and idle > (auto_unload_minutes * 60):
+            logger.info(f"Auto-unloading model after {idle/60:.1f} minutes of inactivity")
+            current_handler.unload()
+            current_handler = None
+            last_request_time = None
 
 
 def parse_json_response(text: str) -> dict:
@@ -128,6 +166,9 @@ def extract_from_pil_image(image, prompt: str) -> dict:
     if current_handler is None:
         load_model()
 
+    # Update activity timestamp
+    update_last_request_time()
+
     # Get raw response from model
     raw_response = current_handler.extract(image, prompt)
     logger.debug(f"Raw model response: {raw_response[:500]}...")
@@ -183,6 +224,9 @@ async def get_status():
         model_loaded=current_handler is not None and current_handler.is_loaded,
         model_name=current_handler.name if current_handler else None,
         device=current_handler.device_info if current_handler else None,
+        idle_seconds=get_idle_seconds(),
+        auto_unload_enabled=auto_unload_minutes is not None,
+        auto_unload_minutes=auto_unload_minutes,
     )
 
 
@@ -263,7 +307,7 @@ async def load(model_name: str = DEFAULT_MODEL):
 @app.post("/unload")
 async def unload():
     """Unload the current model to free memory."""
-    global current_handler
+    global current_handler, last_request_time
 
     if current_handler is None:
         return {"status": "ok", "message": "No model loaded"}
@@ -271,15 +315,66 @@ async def unload():
     model_name = current_handler.name
     current_handler.unload()
     current_handler = None
+    last_request_time = None
 
     return {"status": "ok", "message": f"Unloaded {model_name}"}
+
+
+@app.post("/request-unload")
+async def request_unload():
+    """Request model unload (for GPU coordination between services).
+
+    Other GPU services can call this endpoint to politely ask this service
+    to unload its model if idle. Returns whether unload was performed.
+    """
+    global current_handler, last_request_time
+
+    if current_handler is None:
+        return {
+            "status": "ok",
+            "unloaded": False,
+            "message": "No model loaded",
+        }
+
+    idle = get_idle_seconds()
+
+    # Only unload if idle for at least 30 seconds (actively processing)
+    if idle is not None and idle < 30:
+        return {
+            "status": "busy",
+            "unloaded": False,
+            "message": f"Model in use (idle {idle:.0f}s)",
+            "idle_seconds": idle,
+        }
+
+    # Unload the model
+    model_name = current_handler.name
+    logger.info(f"Unloading {model_name} on request from another service")
+    current_handler.unload()
+    current_handler = None
+    last_request_time = None
+
+    return {
+        "status": "ok",
+        "unloaded": True,
+        "message": f"Unloaded {model_name}",
+        "idle_seconds": idle,
+    }
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Start background tasks."""
+    if auto_unload_minutes is not None:
+        logger.info(f"Auto-unload enabled: {auto_unload_minutes} minutes")
+        asyncio.create_task(auto_unload_task())
 
 
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Invoice OCR Inference Server")
-    parser.add_argument("--host", default="127.0.0.1", help="Host to bind to")
+    parser.add_argument("--host", default="10.99.0.3", help="Host to bind to")
     parser.add_argument("--port", type=int, default=8765, help="Port to bind to")
     parser.add_argument("--preload", action="store_true", help="Preload model on startup")
     parser.add_argument(
@@ -287,8 +382,17 @@ if __name__ == "__main__":
         default=DEFAULT_MODEL,
         help="Model to use (default: Qwen/Qwen2-VL-7B-Instruct)",
     )
+    parser.add_argument(
+        "--auto-unload-minutes",
+        type=int,
+        default=None,
+        help="Auto-unload model after N minutes of inactivity (default: disabled)",
+    )
 
     args = parser.parse_args()
+
+    # Set global auto-unload config
+    auto_unload_minutes = args.auto_unload_minutes
 
     if args.preload:
         load_model(args.model)

@@ -34,7 +34,7 @@ class Qwen2VL7BHandler(ModelHandler):
         self._processor = None
         self._device: Optional[str] = None
 
-    def load(self, device: str = "auto") -> None:
+    def load(self, device: str = "auto", max_retries: int = 3, retry_delay: int = 30) -> None:
         if self._model is not None:
             logger.info(f"Model already loaded: {self.name}")
             return
@@ -53,13 +53,33 @@ class Qwen2VL7BHandler(ModelHandler):
         else:
             self._device = device
 
-        self._processor = AutoProcessor.from_pretrained(self.name)
-        self._model = Qwen2VLForConditionalGeneration.from_pretrained(
-            self.name,
-            torch_dtype=dtype,
-            device_map=self._device,
-        )
-        logger.info(f"Model loaded on {self._device}")
+        # Retry on OOM - other services may be using GPU
+        for attempt in range(max_retries):
+            try:
+                self._processor = AutoProcessor.from_pretrained(self.name)
+                self._model = Qwen2VLForConditionalGeneration.from_pretrained(
+                    self.name,
+                    torch_dtype=dtype,
+                    device_map=self._device,
+                )
+                logger.info(f"Model loaded on {self._device}")
+                return
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower() or "cuda error" in str(e).lower():
+                    if attempt < max_retries - 1:
+                        logger.warning(f"OOM error on attempt {attempt + 1}/{max_retries}")
+                        logger.info(f"GPU busy - waiting {retry_delay}s for other services to release memory...")
+                        # Clean up any partial allocation
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        import time
+                        time.sleep(retry_delay)
+                    else:
+                        logger.error(f"Failed to load model after {max_retries} attempts")
+                        raise
+                else:
+                    # Not an OOM error - raise immediately
+                    raise
 
     def unload(self) -> None:
         if self._model is not None:
@@ -132,7 +152,7 @@ class Qwen2VL2BHandler(ModelHandler):
         self._processor = None
         self._device: Optional[str] = None
 
-    def load(self, device: str = "auto") -> None:
+    def load(self, device: str = "auto", max_retries: int = 3, retry_delay: int = 30) -> None:
         if self._model is not None:
             logger.info(f"Model already loaded: {self.name}")
             return
@@ -151,13 +171,33 @@ class Qwen2VL2BHandler(ModelHandler):
         else:
             self._device = device
 
-        self._processor = AutoProcessor.from_pretrained(self.name)
-        self._model = Qwen2VLForConditionalGeneration.from_pretrained(
-            self.name,
-            torch_dtype=dtype,
-            device_map=self._device,
-        )
-        logger.info(f"Model loaded on {self._device}")
+        # Retry on OOM - other services may be using GPU
+        for attempt in range(max_retries):
+            try:
+                self._processor = AutoProcessor.from_pretrained(self.name)
+                self._model = Qwen2VLForConditionalGeneration.from_pretrained(
+                    self.name,
+                    torch_dtype=dtype,
+                    device_map=self._device,
+                )
+                logger.info(f"Model loaded on {self._device}")
+                return
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower() or "cuda error" in str(e).lower():
+                    if attempt < max_retries - 1:
+                        logger.warning(f"OOM error on attempt {attempt + 1}/{max_retries}")
+                        logger.info(f"GPU busy - waiting {retry_delay}s for other services to release memory...")
+                        # Clean up any partial allocation
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        import time
+                        time.sleep(retry_delay)
+                    else:
+                        logger.error(f"Failed to load model after {max_retries} attempts")
+                        raise
+                else:
+                    # Not an OOM error - raise immediately
+                    raise
 
     def unload(self) -> None:
         if self._model is not None:

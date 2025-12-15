@@ -1,7 +1,7 @@
 # Invoice OCR Configuration
 
 [model]
-name = "Qwen/Qwen2-VL-7B-Instruct"
+name = "microsoft/Florence-2-large"
 backend = "transformers"  # transformers, vllm, ollama
 quantization = "none"     # none, int8, int4
 device = "cuda:0"
@@ -22,7 +22,7 @@ confidence_threshold = 0.7  # Flag for review below this
 [inference]
 max_tokens = 4096
 temperature = 0.1         # Low for structured extraction
-server_url = "http://127.0.0.1:8765"
+server_url = "http://10.99.0.3:8765"
 
 [prompts]
 default_template = "prompts/invoice_extract.txt"

@@ -8,6 +8,7 @@ from typing import Dict, Type, List
 from .base import ModelHandler
 from .qwen import Qwen2VL7BHandler, Qwen2VL2BHandler
 from .florence import Florence2Handler
+from .ollama import OllamaLlavaHandler
 
 
 # Registry of available model handlers
@@ -15,10 +16,12 @@ MODEL_REGISTRY: Dict[str, Type[ModelHandler]] = {
     "Qwen/Qwen2-VL-7B-Instruct": Qwen2VL7BHandler,
     "Qwen/Qwen2-VL-2B-Instruct": Qwen2VL2BHandler,
     "microsoft/Florence-2-large": Florence2Handler,
+    "llava:13b": OllamaLlavaHandler,
     # Aliases for convenience
     "qwen-7b": Qwen2VL7BHandler,
     "qwen-2b": Qwen2VL2BHandler,
     "florence-2": Florence2Handler,
+    "llava": OllamaLlavaHandler,
 }
 
 # Default model
@@ -60,4 +63,5 @@ __all__ = [
     "Qwen2VL7BHandler",
     "Qwen2VL2BHandler",
     "Florence2Handler",
+    "OllamaLlavaHandler",
 ]

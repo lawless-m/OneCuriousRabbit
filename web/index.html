@@ -168,6 +168,29 @@
             display: block;
         }
 
+        .result-preview {
+            margin-top: 0.75rem;
+            border: 1px solid #e0e0e0;
+            border-radius: 4px;
+            overflow: hidden;
+            max-height: 500px;
+        }
+
+        .result-preview iframe,
+        .result-preview img {
+            width: 100%;
+            height: 500px;
+            border: none;
+            display: block;
+        }
+
+        .result-preview img {
+            height: auto;
+            max-height: 500px;
+            object-fit: contain;
+            background: #f9fafb;
+        }
+
         .toggle-json {
             font-size: 0.75rem;
             color: #2563eb;
@@ -266,6 +289,7 @@
         const results = document.getElementById('results');
         const resultsList = document.getElementById('resultsList');
         const extractionData = {}; // Store extraction results for download
+        const fileData = {}; // Store file data for preview
 
         function getServerUrl() {
             return document.getElementById('serverUrl').value.trim();
@@ -326,6 +350,13 @@
         });
 
         async function handleFiles(files) {
+            // Clear previous results
+            resultsList.innerHTML = '';
+            results.style.display = 'none';
+            // Clear stored data
+            Object.keys(extractionData).forEach(k => delete extractionData[k]);
+            Object.keys(fileData).forEach(k => delete fileData[k]);
+
             for (const file of files) {
                 await processFile(file);
             }
@@ -353,6 +384,11 @@
             try {
                 // Convert file to base64
                 const base64 = await fileToBase64(file);
+
+                // Store file data for preview
+                const isPdf = file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf');
+                const mimeType = isPdf ? 'application/pdf' : file.type;
+                fileData[itemId] = { base64, mimeType, isPdf };
 
                 // Send to server
                 const res = await fetch(`${getServerUrl()}/extract-base64`, {
@@ -397,13 +433,49 @@
         function updateResult(itemId, filename, data, success) {
             const item = document.getElementById(itemId);
 
-            if (success && data.header) {
+            if (success && data.not_invoice) {
+                // Document is not an invoice
+                const fd = fileData[itemId];
+                let previewHtml = '';
+                if (fd) {
+                    if (fd.isPdf) {
+                        previewHtml = `<div class="result-preview"><iframe src="data:application/pdf;base64,${fd.base64}"></iframe></div>`;
+                    } else {
+                        previewHtml = `<div class="result-preview"><img src="data:${fd.mimeType};base64,${fd.base64}" alt="Document preview"></div>`;
+                    }
+                }
+
+                item.innerHTML = `
+                    <div class="result-header">
+                        <span class="result-filename">${filename}</span>
+                        <span class="result-confidence low">Not an invoice</span>
+                    </div>
+                    <div class="result-details">
+                        This document appears to be: <strong>${data.document_type || 'unknown document type'}</strong>
+                    </div>
+                    ${previewHtml}
+                `;
+            } else if (success && (data.header || data.supplier_name || data.invoice_number)) {
+                // Handle both nested (data.header) and flat formats
+                const header = data.header || data;
                 // Store extraction data for download
                 extractionData[itemId] = { filename, data };
-                const confidence = data.confidence?.overall;
+                const confidence = data.confidence?.overall || header.confidence?.overall;
                 const confidenceClass = confidence && confidence < 0.7 ? 'low' : '';
                 const confidenceText = confidence ? `${(confidence * 100).toFixed(0)}% confidence` : '';
-                const lineCount = data.line_items?.length || 0;
+                const lineItems = data.line_items || header.line_items || [];
+                const lineCount = lineItems.length;
+
+                // Build preview HTML
+                const fd = fileData[itemId];
+                let previewHtml = '';
+                if (fd) {
+                    if (fd.isPdf) {
+                        previewHtml = `<div class="result-preview"><iframe src="data:application/pdf;base64,${fd.base64}"></iframe></div>`;
+                    } else {
+                        previewHtml = `<div class="result-preview"><img src="data:${fd.mimeType};base64,${fd.base64}" alt="Document preview"></div>`;
+                    }
+                }
 
                 item.innerHTML = `
                     <div class="result-header">
@@ -411,18 +483,30 @@
                         ${confidenceText ? `<span class="result-confidence ${confidenceClass}">${confidenceText}</span>` : ''}
                     </div>
                     <div class="result-details">
-                        <strong>${data.header.supplier_name || 'Unknown'}</strong> -
-                        Invoice ${data.header.invoice_number || 'N/A'} -
-                        ${data.header.currency || ''} ${data.header.gross_total?.toFixed(2) || '0.00'} -
+                        <strong>${header.supplier_name || 'Unknown'}</strong> -
+                        Invoice ${header.invoice_number || 'N/A'} -
+                        ${header.currency || ''} ${parseFloat(header.gross_total || 0).toFixed(2)} -
                         ${lineCount} line item${lineCount !== 1 ? 's' : ''}
                         <span class="toggle-json" onclick="toggleJson('${itemId}')">Show JSON</span>
                         <span class="download-btn" onclick="downloadExcel('${itemId}', '${filename}')">Download Excel</span>
                     </div>
                     <pre class="result-json" id="json-${itemId}">${JSON.stringify(data, null, 2)}</pre>
+                    ${previewHtml}
                 `;
             } else {
-                let errorDetails = data.error || 'Unknown error';
+                let errorDetails = data.error || '';
                 let helpText = '';
+
+                // Build preview for errors too
+                const fd = fileData[itemId];
+                let previewHtml = '';
+                if (fd) {
+                    if (fd.isPdf) {
+                        previewHtml = `<div class="result-preview"><iframe src="data:application/pdf;base64,${fd.base64}"></iframe></div>`;
+                    } else {
+                        previewHtml = `<div class="result-preview"><img src="data:${fd.mimeType};base64,${fd.base64}" alt="Document preview"></div>`;
+                    }
+                }
 
                 if (errorDetails.includes('Server not responding')) {
                     helpText = '<br><small>The backend inference server is not responding. Check server logs.</small>';
@@ -430,6 +514,12 @@
                     helpText = '<br><small>GPU is busy with another task. Wait a moment and try again.</small>';
                 } else if (errorDetails.includes('timeout')) {
                     helpText = '<br><small>Model is loading (may take 30-60 seconds on first request).</small>';
+                } else if (!errorDetails && success) {
+                    // Model returned something but not in expected format
+                    errorDetails = 'Model returned unexpected format';
+                    helpText = `<br><small>Response: ${JSON.stringify(data).substring(0, 200)}...</small>`;
+                } else if (!errorDetails) {
+                    errorDetails = 'Unknown error';
                 }
 
                 item.innerHTML = `
@@ -440,6 +530,7 @@
                         ${errorDetails}
                         ${helpText}
                     </div>
+                    ${previewHtml}
                 `;
             }
         }
@@ -454,6 +545,7 @@
             if (!extraction) return;
 
             const { data } = extraction;
+            const header = data.header || data;
 
             // Create workbook
             const wb = XLSX.utils.book_new();
@@ -461,26 +553,27 @@
             // Header sheet
             const headerData = [
                 ['Field', 'Value'],
-                ['Supplier', data.header.supplier_name || ''],
-                ['Customer', data.header.customer_name || ''],
-                ['Invoice Number', data.header.invoice_number || ''],
-                ['Invoice Date', data.header.invoice_date || ''],
-                ['PO Reference', data.header.po_reference || ''],
-                ['Currency', data.header.currency || ''],
-                ['Net Total', data.header.net_total || 0],
-                ['VAT Amount', data.header.vat_amount || 0],
-                ['Gross Total', data.header.gross_total || 0],
-                ['Payment Due Date', data.header.payment_due_date || '']
+                ['Supplier', header.supplier_name || ''],
+                ['Customer', header.customer_name || ''],
+                ['Invoice Number', header.invoice_number || ''],
+                ['Invoice Date', header.invoice_date || ''],
+                ['PO Reference', header.po_reference || ''],
+                ['Currency', header.currency || ''],
+                ['Net Total', header.net_total || 0],
+                ['VAT Amount', header.vat_amount || 0],
+                ['Gross Total', header.gross_total || 0],
+                ['Payment Due Date', header.payment_due_date || '']
             ];
             const wsHeader = XLSX.utils.aoa_to_sheet(headerData);
             XLSX.utils.book_append_sheet(wb, wsHeader, 'Header');
 
             // Line items sheet
-            if (data.line_items && data.line_items.length > 0) {
+            const lineItems = data.line_items || header.line_items || [];
+            if (lineItems.length > 0) {
                 const lineItemsData = [
                     ['Line', 'Product Code', 'Description', 'Quantity', 'Unit', 'Unit Price', 'VAT Rate', 'Line Total']
                 ];
-                data.line_items.forEach(item => {
+                lineItems.forEach(item => {
                     lineItemsData.push([
                         item.line_number || '',
                         item.product_code || '',
@@ -502,7 +595,18 @@
         }
 
         function getDefaultPrompt() {
-            return `You are an invoice data extraction system. Extract all relevant information from this invoice image and return it as valid JSON.
+            return `You are an invoice data extraction system. First, determine if this document is an invoice or similar financial document (bill, receipt, credit note, statement).
+
+If this is NOT an invoice or financial document, return ONLY this JSON:
+{"not_invoice": true, "document_type": "describe what type of document this appears to be"}
+
+CRITICAL RULES:
+1. NEVER invent or hallucinate data. Only extract text that is actually visible in the document.
+2. If you cannot read a value clearly, use null - do NOT make up placeholder values like "ABC123", "Product A", "XYZ456" etc.
+3. Every value you return must be directly readable from the document image.
+4. Line items include ANY itemized charges - look for: product lines, service charges, fees, "description of charges", itemized costs, shipping charges, handling fees, etc. If there are charges listed with amounts, extract them as line items.
+
+If this IS an invoice, extract all relevant information and return it as valid JSON.
 
 CRITICAL: This invoice is being received BY "S D Ramsden & Co Ltd" (also known as "Ramsden International").
 They are the CUSTOMER/BUYER, NOT the supplier.
